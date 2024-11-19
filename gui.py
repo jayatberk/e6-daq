@@ -5,9 +5,11 @@ from queue import Empty
 import tkinter as tk
 from tkinter import ttk, filedialog
 from pipeline_builder import FileProcessor, process_queue, FileWatcher
-import matplotlib.pyplot as plt
 import logging
 import numpy as np  # Ensure numpy is imported
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -43,14 +45,33 @@ class GUIApp:
         self.main_frame = ttk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Listbox to display processed files with accept/reject status
-        self.file_listbox = tk.Listbox(self.main_frame, height=15)
+        # Left frame for listbox
+        self.left_frame = ttk.Frame(self.main_frame)
+        self.left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Listbox to display processed files with accept/reject status and stats
+        self.file_listbox = tk.Listbox(self.left_frame, height=15)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Scrollbar for the listbox
-        self.scrollbar = ttk.Scrollbar(self.main_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.scrollbar = ttk.Scrollbar(self.left_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
         self.scrollbar.pack(side=tk.LEFT, fill=tk.Y)
         self.file_listbox.config(yscrollcommand=self.scrollbar.set)
+
+        # Right frame for FFT plot
+        self.right_frame = ttk.Frame(self.main_frame)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # Create a matplotlib Figure
+        self.figure = plt.Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title("FFT of the Signal")
+        self.ax.set_xlabel("Frequency")
+        self.ax.set_ylabel("Amplitude")
+
+        # Embed the matplotlib Figure in Tkinter Canvas
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.right_frame)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # Button to manually add files
         self.add_file_button = ttk.Button(self.root, text="Add File", command=self.add_file)
@@ -75,65 +96,45 @@ class GUIApp:
     def update_display(self):
         try:
             while True:
-                processor_type, output_file, accepted = self.processor.display_queue.get_nowait()
+                processor_type, output_file, accepted, stats = self.processor.display_queue.get_nowait()
                 status = "Accepted" if accepted else "Rejected"
-                display_text = f"{output_file.name} - {status}"
+
+                # Build the display text with relevant statistics
+                if stats:
+                    percent_space_correct = stats.get('percent_space_correct', 0.0)
+                    avg_time_gap = stats.get('avg_time_gap', 0.0)
+                    num_shots = stats.get('num_shots', 0)
+                    deviation_threshold_percent = stats.get('deviation_threshold_percent', 20.0)
+
+                    display_text = (f"{output_file.name} - {status} "
+                                    f"(Space Correct: {percent_space_correct:.2f}%, "
+                                    f"Avg Time Gap: {avg_time_gap:.2f}, "
+                                    f"Shots: {num_shots}, "
+                                    f"Threshold: {deviation_threshold_percent}%)")
+                else:
+                    display_text = f"{output_file.name} - {status}"
+
                 logging.info(f"Displaying: {display_text}")
                 self.file_listbox.insert(tk.END, display_text)
-                # Now attempt to display results even if rejected (GUI handles this)
-                if processor_type == "fpga":
-                    self.display_fpga_results(output_file, accepted)
-                elif processor_type == "photon":
-                    self.display_photon_results(output_file, accepted)
+
+                # Update the FFT plot
+                fft_data = stats.get('fft_data', None)
+                if fft_data is not None:
+                    self.update_fft_plot(fft_data)
         except Empty:
             pass
         except Exception as e:
             logging.error(f"Error in update_display: {str(e)}")
         self.root.after(1000, self.update_display)
 
-    def display_photon_results(self, output_file: Path, accepted: bool):
-        """Display results from processed photon data"""
-        data = np.load(output_file)
-        keys = data.files
-        if 'timestamps' not in keys or 'time_diffs' not in keys:
-            return
-
-        timestamps = data['timestamps']
-        time_diffs = data['time_diffs']
-
-        # Ensure lengths match
-        min_length = min(len(timestamps), len(time_diffs))
-
-        if min_length == 0:
-            logging.warning(f"No data to plot in {output_file.name}")
-            return
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(timestamps[:min_length], time_diffs[:min_length], 'r-')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Filtered Time Differences (s)')
-        title_status = "Accepted" if accepted else "Rejected"
-        plt.title(f'Filtered Photon Time Differences - {title_status}')
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-
-    def display_fpga_results(self, output_file: Path, accepted: bool):
-        """Display results from processed FPGA data"""
-        data = np.load(output_file)
-        data_array = data['data']
-        if len(data_array) == 0:
-            logging.warning(f"No data to plot in {output_file.name}")
-            return
-        plt.figure(figsize=(10, 6))
-        plt.plot(data_array, 'b-')
-        plt.xlabel('Sample Index')
-        plt.ylabel('Value')
-        title_status = "Accepted" if accepted else "Rejected"
-        plt.title(f'Processed FPGA Data - {title_status}')
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+    def update_fft_plot(self, fft_data):
+        """Update the FFT plot with new data."""
+        self.ax.clear()
+        self.ax.plot(fft_data['freq'], fft_data['amplitude'])
+        self.ax.set_title("FFT of the Signal")
+        self.ax.set_xlabel("Frequency")
+        self.ax.set_ylabel("Amplitude")
+        self.canvas.draw()
 
     def on_closing(self):
         logging.info("Shutting down...")

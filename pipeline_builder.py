@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import threading
 from queue import Queue, Empty
-from typing import Dict
+from typing import Dict, Tuple
 import logging
 import numpy as np
 from watchdog.observers import Observer
@@ -23,10 +23,9 @@ class FileProcessor:
         self.observer = Observer()
         self.should_continue = True
 
-        # Initialize lists to store creation times and acceptance status
-        self.jkam_creation_time_array = []  # List of file creation times
-        self.accepted_files = []            # List of acceptance statuses
-        self.avg_time_gap = None            # Average time gap between files
+        # Initialize parameters for acceptance logic
+        self.deviation_threshold_ratio = 0.2  # 20% deviation threshold
+        self.acceptance_ratio_threshold = 80.0  # Accept if at least 80% are space_correct
 
     def register_processor(self, extension: str, processor_type: str):
         self.processors[extension] = processor_type
@@ -52,50 +51,111 @@ class FileProcessor:
             return
 
         # Evaluate the processed file
-        accepted = self.evaluate_file(output_file, filepath)
+        accepted, stats = self.evaluate_file(output_file)
+
+        # Perform FFT and add it to stats
+        fft_data = self.perform_fft(output_file)
+        stats['fft_data'] = fft_data
 
         # Add to display queue
-        self.display_queue.put((processor_type, output_file, accepted))
+        self.display_queue.put((processor_type, output_file, accepted, stats))
 
         logging.info(f"Finished processing: {filepath}")
 
-    def evaluate_file(self, output_file: Path, original_file: Path) -> bool:
-        """Decide whether to accept or reject the file based on time gaps between files."""
+    def evaluate_file(self, output_file: Path) -> Tuple[bool, Dict[str, float]]:
+        """Decide whether to accept or reject the file based on data within the file."""
         try:
-            # Get the creation time of the original file
-            time_temp = os.path.getmtime(original_file)
-            self.jkam_creation_time_array.append(time_temp)
-            num_shots = len(self.jkam_creation_time_array)
-            shot_num = num_shots - 1  # Current shot index
-
-            # If less than 2 files, accept by default
+            data = np.load(output_file)
+            if 'timestamps' not in data.files:
+                logging.warning(f"No 'timestamps' found in {output_file.name}")
+                return False, {}
+            timestamps = data['timestamps']
+            num_shots = len(timestamps)
             if num_shots < 2:
-                self.avg_time_gap = None
-                accepted = True
-                self.accepted_files.append(accepted)
-                return accepted
-
-            # Calculate average time gap between files
-            time_diffs = np.diff(self.jkam_creation_time_array)
-            self.avg_time_gap = np.mean(time_diffs)
-
-            space_correct = True
-
-            # Check time gap with previous file
-            prev_time = self.jkam_creation_time_array[shot_num - 1]
-            time_gap = time_temp - prev_time
-            if abs(time_gap - self.avg_time_gap) > 0.3 * self.avg_time_gap:
-                space_correct = False
-                logging.info(f'Error at shot number {shot_num}: Time gap deviation exceeds threshold.')
-
-            # Decide acceptance based on space correctness
-            accepted = space_correct
-            self.accepted_files.append(accepted)
-            return accepted
-
+                logging.warning(f"Not enough timestamps in {output_file.name}")
+                return False, {}
+    
+            # Calculate average time gap
+            avg_time_gap = (timestamps[-1] - timestamps[0]) / (num_shots - 1)
+    
+            # Check space correctness for each shot
+            mask_space_correct = np.ones(num_shots, dtype=bool)
+            for shot_num in range(num_shots):
+                time_temp = timestamps[shot_num]
+                space_correct = True
+                if shot_num > 0:
+                    prev_time = timestamps[shot_num - 1]
+                    if abs(time_temp - prev_time - avg_time_gap) > self.deviation_threshold_ratio * avg_time_gap:
+                        space_correct = False
+                if shot_num < (num_shots - 1):
+                    next_time = timestamps[shot_num + 1]
+                    if abs(-time_temp + next_time - avg_time_gap) > self.deviation_threshold_ratio * avg_time_gap:
+                        space_correct = False
+                mask_space_correct[shot_num] = space_correct
+    
+            # Decide acceptance based on percentage of space_correct shots
+            num_space_correct = np.sum(mask_space_correct)
+            percent_space_correct = (num_space_correct / num_shots) * 100
+    
+            accepted = percent_space_correct >= self.acceptance_ratio_threshold
+    
+            stats = {
+                'avg_time_gap': avg_time_gap,
+                'num_shots': num_shots,
+                'num_space_correct': num_space_correct,
+                'percent_space_correct': percent_space_correct,
+                'deviation_threshold_percent': self.deviation_threshold_ratio * 100,
+            }
+    
+            if accepted:
+                logging.info(f"File {output_file.name} accepted: {percent_space_correct:.2f}% shots are space_correct.")
+            else:
+                logging.info(f"File {output_file.name} rejected: {percent_space_correct:.2f}% shots are space_correct.")
+    
+            return accepted, stats
         except Exception as e:
             logging.error(f"Error evaluating file {output_file.name}: {str(e)}")
-            return False
+            return False, {}
+
+    def perform_fft(self, output_file: Path):
+        """Perform FFT on the timestamps data."""
+        try:
+            data = np.load(output_file)
+            if 'timestamps' not in data.files:
+                logging.warning(f"No 'timestamps' found in {output_file.name} for FFT.")
+                return None
+
+            timestamps = data['timestamps']
+            if len(timestamps) < 2:
+                logging.warning(f"Not enough data for FFT in {output_file.name}.")
+                return None
+
+            # Calculate the sampling interval (assuming uniform sampling)
+            time_intervals = np.diff(timestamps)
+            dt = np.mean(time_intervals)
+
+            # Interpolate timestamps to create a uniformly sampled signal
+            min_time = timestamps[0]
+            max_time = timestamps[-1]
+            num_samples = int((max_time - min_time) / dt)
+            uniform_times = np.linspace(min_time, max_time, num_samples)
+            signal = np.interp(uniform_times, timestamps, np.ones_like(timestamps))
+
+            # Perform FFT
+            fft_values = np.fft.fft(signal)
+            fft_freq = np.fft.fftfreq(len(signal), d=dt)
+
+            # Only keep the positive frequencies
+            positive_freqs = fft_freq > 0
+            fft_freq = fft_freq[positive_freqs]
+            fft_values = np.abs(fft_values[positive_freqs])
+
+            # Return FFT data
+            fft_data = {'freq': fft_freq, 'amplitude': fft_values}
+            return fft_data
+        except Exception as e:
+            logging.error(f"Error performing FFT on {output_file.name}: {str(e)}")
+            return None
 
 
 class FileWatcher(FileSystemEventHandler):
