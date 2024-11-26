@@ -1,3 +1,5 @@
+# gui.py
+
 import threading
 import os
 from pathlib import Path
@@ -10,6 +12,8 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import mysql.connector
+from mysql.connector import Error
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -31,12 +35,15 @@ class GUIApp:
         self.experiment_numbers = []
         self.current_fft_data = None  # To store FFT data for plotting
 
+        self.setup_database()  # Initialize the database connection
+
     def setup_processor(self):
         # Register processor types for different file extensions
         self.processor.register_processor(".bin", "photon")
         self.processor.register_processor(".txt", "fpga")
         self.processor.register_processor(".csv", "photon")
         self.processor.register_processor(".dat", "photon")
+        self.processor.register_processor(".h5", "gagescope")  # Register Gagescope files
 
         # Set up the file watcher
         self.watch_path = "input_files"
@@ -46,6 +53,69 @@ class GUIApp:
         self.event_handler = FileWatcher(self.processor)
         self.processor.observer.schedule(self.event_handler, self.watch_path, recursive=False)
         self.processor.observer.start()
+
+    def setup_database(self):
+        """Set up the database connection."""
+        try:
+            self.connection = mysql.connector.connect(
+                host='localhost',
+                database='file_processor_db',
+                user='user1',
+                password='sisyphus'
+            )
+            if self.connection.is_connected():
+                logging.info("Connected to MySQL database")
+                # Ensure the table exists
+                self.create_table()
+        except Error as e:
+            logging.error(f"Error connecting to MySQL database: {e}")
+            self.connection = None
+
+    def create_table(self):
+        """Create the experiment_results table if it doesn't exist."""
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS experiment_results (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            experiment_number INT NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            accepted BOOLEAN NOT NULL,
+            summary_statistics TEXT,
+            processor_type VARCHAR(50),
+            cumulative_value INT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        cursor = self.connection.cursor()
+        cursor.execute(create_table_query)
+        self.connection.commit()
+        cursor.close()
+
+    def insert_record(self, experiment_number, file_name, accepted, summary_statistics, processor_type, cumulative_value):
+        """Insert a new record into the database."""
+        if self.connection is None or not self.connection.is_connected():
+            logging.error("Not connected to the database. Record not inserted.")
+            return
+        insert_query = """
+        INSERT INTO experiment_results (experiment_number, file_name, accepted, summary_statistics, processor_type, cumulative_value)
+        VALUES (%s, %s, %s, %s, %s, %s);
+        """
+        try:
+            cursor = self.connection.cursor()
+            # Ensure data types are standard Python types
+            data_tuple = (
+                int(experiment_number),
+                file_name,
+                bool(accepted),
+                summary_statistics,
+                processor_type,
+                int(cumulative_value)
+            )
+            cursor.execute(insert_query, data_tuple)
+            self.connection.commit()
+            cursor.close()
+            logging.info(f"Inserted record for file {file_name} into the database.")
+        except Error as e:
+            logging.error(f"Error inserting record into MySQL database: {e}")
 
     def create_widgets(self):
         # Create a PanedWindow to allow resizing
@@ -61,7 +131,7 @@ class GUIApp:
         self.paned_window.add(self.right_frame, weight=2)
 
         # Create the table with scrollbars
-        self.create_table()
+        self.create_table_widget()
 
         # Create the graphs in the right frame
         self.create_graphs()
@@ -70,7 +140,7 @@ class GUIApp:
         self.add_file_button = ttk.Button(self.root, text="Add File", command=self.add_file)
         self.add_file_button.pack(side=tk.BOTTOM, pady=5)
 
-    def create_table(self):
+    def create_table_widget(self):
         # Create a frame for the table and scrollbars
         table_frame = ttk.Frame(self.left_frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -80,7 +150,7 @@ class GUIApp:
         self.table = ttk.Treeview(table_frame, columns=columns, show='headings')
         for col in columns:
             self.table.heading(col, text=col)
-            self.table.column(col, anchor='w', width=100, stretch=False)  # Set stretch=False
+            self.table.column(col, anchor='w', width=100, stretch=False)
 
         # Adjust specific columns if needed
         self.table.column("Experiment Number", width=120, anchor='center', stretch=False)
@@ -131,6 +201,10 @@ class GUIApp:
         self.fft_canvas = FigureCanvasTkAgg(self.fft_figure, master=fft_frame)
         self.fft_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # Initially hide the FFT plot
+        fft_frame.pack_forget()
+        self.fft_frame = fft_frame  # Keep a reference to show/hide later
+
     def add_file(self):
         file_paths = filedialog.askopenfilenames()
         if file_paths:
@@ -151,37 +225,55 @@ class GUIApp:
         try:
             while True:
                 processor_type, output_file, accepted, stats = self.processor.display_queue.get_nowait()
-                status = "Accepted" if accepted else "Rejected"
 
-                # Extract necessary data
-                experiment_number = stats.get('experiment_number', 0)
+                # Convert NumPy types to standard Python types
+                accepted = bool(accepted)
+                experiment_number = int(stats.get('experiment_number', 0))
+                cumulative_value = int(stats.get('cumulative_value', 0))
+                num_shots = int(stats.get('num_shots', 0))
+                percent_space_correct = float(stats.get('percent_space_correct', 0.0))
+                avg_time_gap = float(stats.get('avg_time_gap', 0.0))
+                deviation_threshold_percent = float(stats.get('deviation_threshold_percent', 20.0))
+
+                status = "Accepted" if accepted else "Rejected"
                 file_name = stats.get('file_name', '')
-                summary_stats = f"Space Correct: {stats.get('percent_space_correct', 0.0):.2f}%, " \
-                                f"Avg Time Gap: {stats.get('avg_time_gap', 0.0):.2f}, " \
-                                f"Shots: {stats.get('num_shots', 0)}, " \
-                                f"Threshold: {stats.get('deviation_threshold_percent', 20.0)}%"
+                summary_stats = f"Space Correct: {percent_space_correct:.2f}%, " \
+                                f"Avg Time Gap: {avg_time_gap:.2f}, " \
+                                f"Shots: {num_shots}, " \
+                                f"Threshold: {deviation_threshold_percent}%"
 
                 # Add data to table
                 self.table.insert('', tk.END, values=(experiment_number, file_name, status, summary_stats))
 
+                # Insert record into the database
+                self.insert_record(
+                    experiment_number=experiment_number,
+                    file_name=file_name,
+                    accepted=accepted,
+                    summary_statistics=summary_stats,
+                    processor_type=processor_type,
+                    cumulative_value=cumulative_value
+                )
+
                 # Update tracking plot data
-                cumulative_value = stats.get('cumulative_value', 0)
                 self.cumulative_values.append(cumulative_value)
                 self.experiment_numbers.append(experiment_number)
                 self.update_tracking_plot()
 
                 # Update FFT plot data
                 fft_data = stats.get('fft_data', None)
-                if fft_data is not None:
+                if fft_data is not None and processor_type == "gagescope":
                     self.current_fft_data = fft_data
-                    self.update_fft_plot()
+                    self.update_fft_plot(show=True)
                 else:
-                    logging.warning("No FFT data received to update FFT plot.")
+                    # Hide the FFT plot if not a Gagescope file
+                    self.update_fft_plot(show=False)
         except Empty:
             pass
         except Exception as e:
             logging.error(f"Error in update_display: {str(e)}")
-        self.root.after(1000, self.update_display)
+        finally:
+            self.root.after(1000, self.update_display)
 
     def update_tracking_plot(self):
         """Update the tracking plot with new data."""
@@ -193,9 +285,9 @@ class GUIApp:
         self.tracking_ax.grid(True)
         self.tracking_canvas.draw()
 
-    def update_fft_plot(self):
+    def update_fft_plot(self, show=True):
         """Update the FFT plot with new data."""
-        if self.current_fft_data is not None:
+        if show and self.current_fft_data is not None:
             freq = self.current_fft_data.get('freq')
             amplitude = self.current_fft_data.get('amplitude')
             if freq is not None and amplitude is not None and len(freq) > 0 and len(amplitude) > 0:
@@ -206,13 +298,20 @@ class GUIApp:
                 self.fft_ax.set_ylabel("Amplitude")
                 self.fft_ax.grid(True)
                 self.fft_canvas.draw()
+                # Ensure the FFT frame is visible
+                self.fft_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
             else:
                 logging.warning("FFT data is empty. Cannot update FFT plot.")
+                self.fft_frame.pack_forget()
         else:
-            logging.warning("No FFT data available to update FFT plot.")
+            # Hide the FFT plot
+            self.fft_frame.pack_forget()
 
     def on_closing(self):
         logging.info("Shutting down...")
+        if self.connection is not None and self.connection.is_connected():
+            self.connection.close()
+            logging.info("Database connection closed.")
         self.processor.should_continue = False
         self.processor.observer.stop()
         self.processor.observer.join()
@@ -222,12 +321,10 @@ class GUIApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
 
-
 def main():
     root = tk.Tk()
     app = GUIApp(root)
     app.run()
-
 
 if __name__ == "__main__":
     main()

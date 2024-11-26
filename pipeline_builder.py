@@ -1,3 +1,5 @@
+# pipeline_builder.py
+
 import os
 from pathlib import Path
 import threading
@@ -9,11 +11,11 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from photon_processor import process_photon_file
 from fpga_processor import process_fpga_file
+from gagescope_processor import process_gagescope_file  # Import the new processor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 class FileProcessor:
     def __init__(self):
@@ -47,6 +49,8 @@ class FileProcessor:
             output_file = process_photon_file(filepath)
         elif processor_type == "fpga":
             output_file = process_fpga_file(filepath)
+        elif processor_type == "gagescope":
+            output_file = process_gagescope_file(filepath)
         else:
             logging.warning(f"Unknown processor type: {processor_type}")
             return
@@ -58,12 +62,15 @@ class FileProcessor:
         # Evaluate the processed file
         accepted, stats = self.evaluate_file(output_file)
 
-        # Perform FFT and add it to stats
-        fft_data = self.perform_fft(output_file)
-        if fft_data is not None:
-            stats['fft_data'] = fft_data
+        # Perform FFT and add it to stats (only for Gagescope measurements)
+        if processor_type == "gagescope":
+            fft_data = self.perform_fft(output_file)
+            if fft_data is not None:
+                stats['fft_data'] = fft_data
+            else:
+                logging.warning(f"FFT data not available for {output_file.name}")
         else:
-            logging.warning(f"FFT data not available for {output_file.name}")
+            stats['fft_data'] = None  # No FFT data for other file types
 
         # Update cumulative value for tracking plot
         self.total_files_processed += 1
@@ -77,6 +84,7 @@ class FileProcessor:
         stats['experiment_number'] = self.total_files_processed
         stats['file_name'] = output_file.name
         stats['accepted'] = accepted
+        stats['processor_type'] = processor_type  # Include processor type in stats
 
         # Add to display queue
         self.display_queue.put((processor_type, output_file, accepted, stats))
@@ -198,7 +206,6 @@ class FileProcessor:
             logging.error(f"Error performing FFT on {output_file.name}: {str(e)}")
             return None
 
-
 class FileWatcher(FileSystemEventHandler):
     def __init__(self, processor: FileProcessor):
         super().__init__()
@@ -210,7 +217,6 @@ class FileWatcher(FileSystemEventHandler):
             if filepath.suffix in self.processor.processors:
                 # Add a slight delay to ensure the file is fully written
                 threading.Timer(0.5, self.processor.processing_queue.put, args=[filepath]).start()
-
 
 def process_queue(processor: FileProcessor):
     """Worker function to process files from the queue"""
