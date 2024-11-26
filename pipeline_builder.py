@@ -27,6 +27,11 @@ class FileProcessor:
         self.deviation_threshold_ratio = 0.2  # 20% deviation threshold
         self.acceptance_ratio_threshold = 80.0  # Accept if at least 80% are space_correct
 
+        # Keep track of cumulative accepted files for plotting
+        self.total_accepted_files = 0
+        self.total_files_processed = 0
+        self.cumulative_value = 0  # Value for the tracking plot
+
     def register_processor(self, extension: str, processor_type: str):
         self.processors[extension] = processor_type
 
@@ -55,7 +60,23 @@ class FileProcessor:
 
         # Perform FFT and add it to stats
         fft_data = self.perform_fft(output_file)
-        stats['fft_data'] = fft_data
+        if fft_data is not None:
+            stats['fft_data'] = fft_data
+        else:
+            logging.warning(f"FFT data not available for {output_file.name}")
+
+        # Update cumulative value for tracking plot
+        self.total_files_processed += 1
+        if accepted:
+            self.total_accepted_files += 1
+            self.cumulative_value += 1  # Increase linearly
+        else:
+            self.cumulative_value = 0  # Drop to zero on rejection
+
+        stats['cumulative_value'] = self.cumulative_value
+        stats['experiment_number'] = self.total_files_processed
+        stats['file_name'] = output_file.name
+        stats['accepted'] = accepted
 
         # Add to display queue
         self.display_queue.put((processor_type, output_file, accepted, stats))
@@ -74,10 +95,10 @@ class FileProcessor:
             if num_shots < 2:
                 logging.warning(f"Not enough timestamps in {output_file.name}")
                 return False, {}
-    
+
             # Calculate average time gap
             avg_time_gap = (timestamps[-1] - timestamps[0]) / (num_shots - 1)
-    
+
             # Check space correctness for each shot
             mask_space_correct = np.ones(num_shots, dtype=bool)
             for shot_num in range(num_shots):
@@ -92,13 +113,13 @@ class FileProcessor:
                     if abs(-time_temp + next_time - avg_time_gap) > self.deviation_threshold_ratio * avg_time_gap:
                         space_correct = False
                 mask_space_correct[shot_num] = space_correct
-    
+
             # Decide acceptance based on percentage of space_correct shots
             num_space_correct = np.sum(mask_space_correct)
             percent_space_correct = (num_space_correct / num_shots) * 100
-    
+
             accepted = percent_space_correct >= self.acceptance_ratio_threshold
-    
+
             stats = {
                 'avg_time_gap': avg_time_gap,
                 'num_shots': num_shots,
@@ -106,12 +127,12 @@ class FileProcessor:
                 'percent_space_correct': percent_space_correct,
                 'deviation_threshold_percent': self.deviation_threshold_ratio * 100,
             }
-    
+
             if accepted:
                 logging.info(f"File {output_file.name} accepted: {percent_space_correct:.2f}% shots are space_correct.")
             else:
                 logging.info(f"File {output_file.name} rejected: {percent_space_correct:.2f}% shots are space_correct.")
-    
+
             return accepted, stats
         except Exception as e:
             logging.error(f"Error evaluating file {output_file.name}: {str(e)}")
@@ -130,14 +151,34 @@ class FileProcessor:
                 logging.warning(f"Not enough data for FFT in {output_file.name}.")
                 return None
 
+            # Check for monotonicity of timestamps
+            if not np.all(np.diff(timestamps) > 0):
+                logging.warning(f"Timestamps are not strictly increasing in {output_file.name}.")
+                timestamps = np.sort(timestamps)
+
+            # Convert timestamps to numpy array
+            timestamps = np.array(timestamps)
+            logging.info(f"Timestamps range: {timestamps[0]} to {timestamps[-1]}")
+
             # Calculate the sampling interval (assuming uniform sampling)
             time_intervals = np.diff(timestamps)
             dt = np.mean(time_intervals)
+            if dt <= 0:
+                logging.error(f"Invalid sampling interval dt={dt} in {output_file.name}.")
+                return None
+
+            logging.info(f"Average sampling interval dt: {dt}")
 
             # Interpolate timestamps to create a uniformly sampled signal
             min_time = timestamps[0]
             max_time = timestamps[-1]
             num_samples = int((max_time - min_time) / dt)
+            if num_samples <= 0:
+                logging.error(f"Invalid number of samples num_samples={num_samples} in {output_file.name}.")
+                return None
+
+            logging.info(f"Number of samples for FFT: {num_samples}")
+
             uniform_times = np.linspace(min_time, max_time, num_samples)
             signal = np.interp(uniform_times, timestamps, np.ones_like(timestamps))
 
