@@ -17,11 +17,9 @@ def read_npz_file(filepath):
             print(f"  Max: {arr.max()}")
             print(f"  Mean: {arr.mean()}")
     
-    # Plot the data based on available keys
     plt.figure(figsize=(12, 8))
     
     if 'binned_times' in data.files and 'binned_counts' in data.files:
-        # Plot photon counts over time
         plt.subplot(2, 1, 1)
         plt.plot(data['binned_times'] / 1e6, data['binned_counts'], 'b-')
         plt.xlabel('Time (milliseconds)')
@@ -30,7 +28,6 @@ def read_npz_file(filepath):
         plt.grid(True)
     
     if 'time_diffs' in data.files:
-        # Plot histogram of time differences
         plt.subplot(2, 1, 2)
         plt.hist(data['time_diffs'], bins=50, alpha=0.7)
         plt.xlabel('Time difference (nanoseconds)')
